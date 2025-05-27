@@ -179,3 +179,4 @@ data/*
 
 # other files
 output/*
+wandb/*
