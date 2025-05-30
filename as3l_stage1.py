@@ -10,9 +10,11 @@ import torch.nn.functional as F
 from torch import optim
 from torch.backends import cudnn
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+# Removed: from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
 from PIL import ImageFilter, Image
+
+import wandb
 
 
 # --- 1. Data Augmentation and Transforms ---
@@ -418,7 +420,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
 parser = argparse.ArgumentParser(description='SimSiam Self-supervised Pre-training')
 parser.add_argument('--data_root', default='./data', type=str, help='Path to the root directory containing dataset.')
-parser.add_argument('--exp_dir', default='./output/my_as3l_runs', type=str, help='Directory for saving experimental results (e.g., checkpoints, logs).')
+parser.add_argument('--exp_dir', default='./output/AS3L_runs', type=str, help='Directory for saving experimental results (e.g., checkpoints, logs).')
 parser.add_argument('--trial', default='simsiam_pretrain_cifar10_wrn282', type=str, help='Identifier for the experiment trial.')
 parser.add_argument('--img_dim', default=32, type=int, help='Dimension of the input images (e.g., 32x32 for CIFAR-10).')
 parser.add_argument('--arch', default='wrn_28_2', type=str, help='Backbone architecture to use (e.g., wrn_28_2).')
@@ -452,11 +454,20 @@ def main():
     if not path.exists(args.exp_dir):
         makedirs(args.exp_dir)
 
-    # Setup trial-specific directory and logger for TensorBoard
+    # Setup trial-specific directory for checkpoints (wandb can also save them)
     trial_dir = path.join(args.exp_dir, args.trial)
     if not path.exists(trial_dir):
         makedirs(trial_dir)
-    logger = SummaryWriter(trial_dir)
+    
+    # Initialize wandb
+    wandb.init(
+        project="AS3L_SimSiam_CIFAR10", # Your W&B project name
+        name=args.trial,           # Name of this specific run
+        config=args                # Logs all argparse arguments as W&B config
+    )
+    # Optional: Log model architecture and gradients
+    # wandb.watch(model, criterion, log="all", log_freq=100) # Only if you want to log gradients and model structure
+
     print("Parsed Arguments:", vars(args))
 
     train_transforms = transforms.Compose([
@@ -517,7 +528,7 @@ def main():
         print(f"Epoch {epoch}/{args.epochs} - Training...")
 
         train_loss = train(train_loader, model, criterion, optimizer, epoch, args)
-        logger.add_scalar('Loss/train', train_loss, epoch)
+        wandb.log({"train_loss": train_loss, "learning_rate": optimizer.param_groups[0]['lr']}, step=epoch) # W&B log learning rate too
 
         if epoch % args.eval_freq == 0:
             print(f"Epoch {epoch}/{args.epochs} - Validating (KNN)...")
@@ -526,17 +537,23 @@ def main():
 
             if val_top1_acc > best_acc:
                 best_acc = val_top1_acc
+                best_model_path = path.join(trial_dir, '{}_best.pth'.format(args.trial))
                 save_checkpoint(epoch, model.encoder, model.predictor, optimizer, best_acc, # Pass encoder and predictor
-                                path.join(trial_dir, '{}_best.pth'.format(args.trial)),
+                                best_model_path,
                                 'Saving the best full SimSiam model!')
-            logger.add_scalar('Acc/val_top1_knn', val_top1_acc, epoch)
+                wandb.save(best_model_path) # Upload best model to W&B run files
+            
+            wandb.log({"val_top1_knn_acc": val_top1_acc, "best_val_top1_knn_acc": best_acc}, step=epoch) # W&B log
 
         if epoch % args.save_freq == 0:
+            current_checkpoint_path = path.join(trial_dir, 'ckpt_epoch_{}_{}.pth'.format(epoch, args.trial))
             save_checkpoint(epoch, model.encoder, model.predictor, optimizer, val_top1_acc, # Pass encoder and predictor
-                            path.join(trial_dir, 'ckpt_epoch_{}_{}.pth'.format(epoch, args.trial)),
+                            current_checkpoint_path,
                             'Saving checkpoint...')
+            wandb.save(current_checkpoint_path) # Upload checkpoint to W&B run files
 
     print('Training Finished. Best KNN accuracy achieved: {:.4f}'.format(best_acc))
+    wandb.log({"final_best_knn_accuracy": best_acc}) # Log final best accuracy to W&B
 
     # --- AS3L Stage 1: Save the pre-trained encoder (f_self) weights ---
     output_dir = path.dirname(args.encoder_output_path)
@@ -546,19 +563,26 @@ def main():
     print(f"Saving pre-trained encoder weights (f_self) to {args.encoder_output_path}...")
     torch.save(model.encoder.state_dict(), args.encoder_output_path) # Save the encoder's state_dict
     print("Pre-trained encoder weights saved successfully.")
+    
+    # Optionally, you can also upload the final encoder weights to W&B as an artifact
+    artifact = wandb.Artifact(name="final_encoder", type="model")
+    artifact.add_file(args.encoder_output_path)
+    wandb.log_artifact(artifact)
+
+    wandb.run.finish() # Finish the wandb run
 
 
 if __name__ == '__main__':
     main()
 
-# This script is designed to be run as a standalone module.
-# python simsiam_pretrain.py \
+# Use following command to run the script:
+# python as3l_stage1.py \
 #     --data_root ./data \
-#     --exp_dir ./output/as3l_run_4 \
+#     --exp_dir ./output/AS3L_run_1 \
 #     --trial simsiam_pretrain_cifar10_wrn282 \
 #     --epochs 1000 \
 #     --gpu 0 \
 #     --arch wrn_28_2 \
 #     --batch_size 512 \
 #     --num_workers 4 \
-#     --encoder_output_path ./output/my_as3l_runs/simsiam_pretrain_cifar10_wrn282/wrn_28_2_encoder_fself.pth
+#     --encoder_output_path ./output/AS3L_run_1/simsiam_pretrain_cifar10_wrn282/wrn_28_2_encoder_fself.pth

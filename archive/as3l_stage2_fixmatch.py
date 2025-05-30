@@ -14,8 +14,6 @@ from sklearn.cluster import KMeans
 import numpy as np
 from tqdm import tqdm # For progress bars
 
-import wandb # Added for Weights & Biases
-
 # --- 1. Wide ResNet (WRN) Backbone Implementation (Copied from simsiam_pretrain.py) ---
 # Reference: https://github.com/meliketoy/wide-resnet.pytorch/blob/master/models/wideresnet.py
 
@@ -320,11 +318,6 @@ class AS3LStage2:
                 if i % self.args.print_freq == 0:
                     progress.display(i)
             print(f"Fine-tune Epoch {epoch+1} finished. Avg Loss: {losses.avg:.4f}, Top1 Acc: {top1.avg:.2f}")
-            wandb.log({
-                "finetune/loss": losses.avg,
-                "finetune/top1_acc": top1.avg,
-                "finetune/learning_rate": optimizer.param_groups[0]['lr']
-            }, step=epoch)
         
         # After fine-tuning, the linear_classifier itself *is* the f_fine transformation.
         # We need to extract the f_fine features for ALL samples using this trained linear layer.
@@ -398,12 +391,6 @@ class AS3LStage2:
         print(f"Selected {len(selected_labeled_indices)} labeled samples.")
         print(f"Selected samples per class distribution: {np.bincount(selected_labeled_labels, minlength=self.args.num_classes)}")
 
-        # Log selected samples to wandb
-        wandb.log({
-            "selected_labeled_samples/total_count": len(selected_labeled_indices),
-            "selected_labeled_samples/per_class_distribution": wandb.Histogram(selected_labeled_labels)
-        })
-
         return selected_labeled_indices, selected_labeled_labels
 
 
@@ -437,7 +424,7 @@ class AS3LStage2:
                     dominant_label = max(cluster_label_votes[cluster_id], key=cluster_label_votes[cluster_id].get)
                     cluster_dominant_labels[cluster_id] = dominant_label
                 else:
-                    cluster_dominant_labels[cluster_id] = random.randint(0, self.args.num_classes - 1) # Fallback, though ideally all clusters should have votes
+                    cluster_dominant_labels[cluster_id] = random.randint(0, self.args.num_classes - 1)
             
             for i, cluster_id in enumerate(cluster_assignments):
                 original_idx = total_indices[i] 
@@ -446,10 +433,6 @@ class AS3LStage2:
         y_prior = np.argmax(y_prior_votes, axis=1)
 
         print("Prior Pseudo-Labels generation complete.")
-        # Log PPL distribution to wandb
-        wandb.log({
-            "prior_pseudo_labels/distribution": wandb.Histogram(y_prior)
-        })
         return y_prior
 
 
@@ -458,14 +441,9 @@ class AS3LStage2:
         print("--- AS3L Stage 2: Active Learning & Prior Pseudo-labels ---")
 
         # 1. Extract f_self features (output of the SimSiam encoder) for all training data
+        # The feature_dim is now args.feat_dim (2048)
         f_self_features, ground_truth_labels, total_indices = self.extract_features(self.encoder, self.cifar_train_loader, self.args.feat_dim)
         
-        # Log information about extracted features
-        wandb.log({
-            "f_self_features/shape": f_self_features.shape,
-            "f_self_features/memory_bytes": f_self_features.nbytes
-        })
-
         os.makedirs(self.args.output_dir, exist_ok=True)
         np.save(os.path.join(self.args.output_dir, "f_self_features.npy"), f_self_features)
         np.save(os.path.join(self.args.output_dir, "ground_truth_labels.npy"), ground_truth_labels)
@@ -476,10 +454,6 @@ class AS3LStage2:
         f_fine_features = self.finetune_features(f_self_features, ground_truth_labels, total_indices)
         np.save(os.path.join(self.args.output_dir, "f_fine_features.npy"), f_fine_features)
         print(f"Saved f_fine features to {self.args.output_dir}")
-        wandb.log({
-            "f_fine_features/shape": f_fine_features.shape,
-            "f_fine_features/memory_bytes": f_fine_features.nbytes
-        })
 
         # 3. Active Labeled Sample Selection
         selected_labeled_indices, selected_labeled_labels = self.select_labeled_samples(f_fine_features, ground_truth_labels, total_indices)
@@ -492,11 +466,6 @@ class AS3LStage2:
         prior_pseudo_labels = self.generate_prior_pseudo_labels(f_fine_features, selected_labeled_indices, selected_labeled_labels, total_indices)
         np.save(os.path.join(self.args.output_dir, "prior_pseudo_labels.npy"), prior_pseudo_labels)
         print(f"Saved Prior Pseudo-labels to {self.args.output_dir}")
-
-        # Log final artifacts (optional, for the generated files)
-        # artifact = wandb.Artifact(name="as3l_stage2_outputs", type="data")
-        # artifact.add_dir(self.args.output_dir)
-        # wandb.log_artifact(artifact)
 
         print("--- AS3L Stage 2 Completed Successfully ---")
 
@@ -554,34 +523,12 @@ def main():
         
     print("Parsed Arguments:", args)
 
-    # Initialize wandb run
-    wandb.init(
-        project="AS3L_CIFAR10_Stage2", # Your W&B project name for Stage 2
-        name=f"labels_per_class_{args.num_labeled_samples_per_class}_seed_{args.seed}", # Unique run name
-        config=args # Log all argparse arguments as W&B config
-    )
-
     as3l_stage2 = AS3LStage2(args)
     as3l_stage2.run()
-
-    wandb.run.finish() # End the wandb run
-
 
 if __name__ == '__main__':
     main()
 
+
 # This script is designed to be run as a standalone module, use following commands to run the script.
-# python as3l_stage2.py \
-#     --data_root ./data \
-#     --encoder_input_path ./output/AS3L_run_1/simsiam_pretrain_cifar10_wrn282/wrn_28_2_encoder_fself.pth \
-#     --output_dir ./output/AS3L_run_1/as3l_stage2_outputs \
-#     --arch wrn_28_2 \
-#     --backbone_feature_dim 128 \
-#     --feat_dim 2048 \
-#     --num_proj_layers 2 \
-#     --num_classes 10 \
-#     --num_labeled_samples_per_class 10 \
-#     --finetune_epochs 40 \
-#     --num_clustering_runs_C 6 \
-#     --gpu 0 \
-#     --seed 42
+# python as3l_stage2.py     --data_root ./data     --encoder_input_path ./output/AS3L_run_1/simsiam_pretrain_cifar10_wrn282/wrn_28_2_encoder_fself.pth     --output_dir ./output/AS3L_run_1/as3l_stage2_outputs     --arch wrn_28_2     --backbone_feature_dim 128     --feat_dim 2048     --num_proj_layers 2     --num_classes 10     --num_labeled_samples_per_class 10     --finetune_epochs 40     --num_clustering_runs_C 6     --gpu 0     --seed 42

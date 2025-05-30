@@ -671,15 +671,15 @@ if __name__ == "__main__":
 # This script is designed to be run as a standalone module, use following commands to run the script.
 # python as3l_stage3.py \
 #     --data_root ./data \
-#     --encoder_weights_path ./output/AS3L_run_1/simsiam_pretrain_cifar10_wrn282/wrn_28_2_encoder_fself.pth \
-#     --stage2_outputs_dir ./output/AS3L_run_1/as3l_stage2_outputs \
-#     --output_model_dir ./output/AS3L_run_1/as3l_stage3_models \
+#     --encoder_weights_path ./output/my_as3l_runs/simsiam_pretrain_cifar10_wrn282/wrn_28_2_encoder_fself.pth \
+#     --stage2_outputs_dir ./output/my_as3l_runs/as3l_stage2_outputs \
+#     --output_model_dir ./output/my_as3l_runs/as3l_stage3_models \
 #     --num_classes 10 \
 #     --total_training_samples 50000 \
 #     --model_arch wrn_28_2 \
 #     --flexmatch_lambda_u 7.0 \
 #     --as3l_switching_epoch 60 \
-#     --epochs 500 \
+#     --epochs 200 \
 #     --labeled_batch_size 64 \
 #     --unlabeled_batch_size_ratio 7 \
 #     --learning_rate 0.03 \
