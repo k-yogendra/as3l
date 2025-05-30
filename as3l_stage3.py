@@ -1,28 +1,3 @@
-# python as3l_stage3.py \
-    # --data_root ./data \
-    # --fself_weights_path ./output/my_as3l_runs/simsiam_pretrain_cifar10/resnet18_backbone_fself.pth \
-    # --stage2_outputs_dir ./output/my_as3l_runs/as3l_stage2_outputs \
-    # --output_model_dir ./output/my_as3l_runs/as3l_stage3_models \
-    # --num_classes 10 \
-    # --model_arch resnet18 \
-    # --flexmatch_T 0.7 \
-    # --flexmatch_p_cutoff 0.95 \
-    # --flexmatch_lambda_u 7.0 \
-    # --flexmatch_hard_label True \
-    # --flexmatch_thresh_warmup True \
-    # --as3l_switching_epoch 60 \
-    # --epochs 200 \
-    # --labeled_batch_size 64 \
-    # --unlabeled_batch_size_ratio 7 \
-    # --learning_rate 0.03 \
-    # --momentum 0.9 \
-    # --weight_decay 5e-4 \
-    # --use_amp \
-    # --num_workers 4 \
-    # --print_freq 100 \
-    # --eval_freq_epochs 5 \
-    # --gpu 0
-
 import argparse
 import os
 import random
@@ -41,6 +16,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from torchvision import datasets, transforms
 
+import wandb # Import wandb
+
 # --- Set random seeds for reproducibility ---
 def set_seed(seed):
     random.seed(seed)
@@ -50,91 +27,100 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-set_seed(42)
+# --- Wide ResNet Definitions (copied directly from simsiam_pretrain.py and adapted) ---
+# This WideResNet will serve as the backbone for the final classifier.
+# Its `fc` layer will now map to `num_classes` for classification.
 
-# --- Wide ResNet / ResNet Definitions (copied directly from previous files) ---
-# BasicBlock and Bottleneck from original SimSiam pretrain script
-class BasicBlock(nn.Module):
-    expansion = 1
-    def __init__(self, in_planes, planes, stride=1):
-        super(BasicBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != self.expansion * planes:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion * planes)
-            )
+class WideBasicBlock(nn.Module):
+    """
+    Wide Residual Network Basic Block.
+    """
+    def __init__(self, in_planes, out_planes, stride, dropRate=0.0):
+        super(WideBasicBlock, self).__init__()
+        self.bn1 = nn.BatchNorm2d(in_planes)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv1 = nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_planes)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_planes, out_planes, kernel_size=3, stride=1,
+                               padding=1, bias=False)
+        self.droprate = dropRate
+        self.equal_channels = (in_planes == out_planes)
+        self.convShortcut = (not self.equal_channels) and nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride,
+                                                                    padding=0, bias=False) or None
+
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
+        out = self.relu1(self.bn1(x))
+        shortcut = out
+        if not self.equal_channels:
+            shortcut = self.convShortcut(out)
+        out = self.relu2(self.bn2(self.conv1(out)))
+        if self.droprate > 0:
+            out = F.dropout(out, p=self.droprate, training=self.training)
+        out = self.conv2(out)
+        out = torch.add(shortcut, out)
         return out
 
-class Bottleneck(nn.Module):
-    expansion = 4
-    def __init__(self, in_planes, planes, stride=1):
-        super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = nn.Conv2d(planes, self.expansion * planes, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(self.expansion * planes)
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != self.expansion * planes:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion * planes)
-            )
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = F.relu(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
-        return out
 
-# ResNet for classification (will be used in Stage 3, to load SimSiam pre-trained weights)
-# Modified to return dict like WideResNet for FlexMatch compatibility
-class ResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10):
-        super(ResNet, self).__init__()
-        self.in_planes = 64
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-        self.fc = nn.Linear(512 * block.expansion, num_classes)
-        self.nChannels = 512 * block.expansion # Feature dimension before FC layer
+class WideResNet(nn.Module):
+    """
+    Wide Residual Network (WRN) adapted for classification.
+    WRN-28-2 means 28 layers deep and a widen_factor of 2.
+    """
+    def __init__(self, depth, widen_factor, num_classes, dropRate=0.0):
+        super(WideResNet, self).__init__()
+        self.in_planes = 16
+        assert ((depth - 4) % 6 == 0), 'Wide-resnet depth should be 6n+4'
+        n = (depth - 4) // 6
+        k = widen_factor
 
-    def _make_layer(self, block, planes, num_blocks, stride):
+        nStages = [16, 16 * k, 32 * k, 64 * k] # For WRN-28-2 (k=2): [16, 32, 64, 128]
+
+        self.conv1 = nn.Conv2d(3, nStages[0], kernel_size=3, stride=1, padding=1, bias=False)
+        self.layer1 = self._make_layer(WideBasicBlock, nStages[1], n, stride=1, dropRate=dropRate)
+        self.layer2 = self._make_layer(WideBasicBlock, nStages[2], n, stride=2, dropRate=dropRate)
+        self.layer3 = self._make_layer(WideBasicBlock, nStages[3], n, stride=2, dropRate=dropRate)
+        self.bn1 = nn.BatchNorm2d(nStages[3])
+        self.relu = nn.ReLU(inplace=True)
+        
+        # This is the final classification head for Stage 3
+        self.fc = nn.Linear(nStages[3], num_classes) # Maps features to class logits
+        self.nChannels = nStages[3] # Feature dimension before FC layer (useful for other models)
+
+        # Initialize layers (optional, as pre-trained weights will overwrite)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                m.bias.data.zero_()
+
+    def _make_layer(self, block, planes, num_blocks, stride, dropRate):
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
-            self.in_planes = planes * block.expansion
+            layers.append(block(self.in_planes, planes, stride, dropRate))
+            self.in_planes = planes
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.conv1(x)
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
-        out = self.layer4(out)
-        out = F.avg_pool2d(out, 4)
-        feat = out.view(-1, self.nChannels) # Feature vector
-        logits = self.fc(feat)
+        out = self.relu(self.bn1(out))
+        out = F.avg_pool2d(out, 8) 
+        feat = out.view(out.size(0), -1) # Feature vector
+        logits = self.fc(feat) # Pass through the classification head
         return {'logits': logits, 'feat': feat}
 
-def ResNet18(num_classes=10):
-    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes)
+def WRN_28_2_Classifier(num_classes=10):
+    return WideResNet(depth=28, widen_factor=2, num_classes=num_classes)
+
 
 # --- Data Augmentations (copied directly from main.py) ---
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
@@ -164,8 +150,8 @@ transform_val = transforms.Compose([
 class CIFAR10_SSL_Dataset_AS3L(Dataset):
     def __init__(self, base_dataset, indices, prior_pseudo_labels_all, transforms_w, transforms_s, is_labeled=False):
         self.base_dataset = base_dataset
-        self.indices = indices # These are the original global indices from the full CIFAR-10 training set (0 to 49999)
-        self.prior_pseudo_labels_all = prior_pseudo_labels_all # The full array of PPL, indexed by original_idx
+        self.indices = indices 
+        self.prior_pseudo_labels_all = prior_pseudo_labels_all 
         self.transforms_w = transforms_w
         self.transforms_s = transforms_s
         self.is_labeled = is_labeled
@@ -174,69 +160,47 @@ class CIFAR10_SSL_Dataset_AS3L(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx_in_subset):
-        original_idx = self.indices[idx_in_subset] # This is the global index for the sample
-        img, label_gt = self.base_dataset[original_idx] # label_gt is the ground truth
+        original_idx = self.indices[idx_in_subset] 
+        img, label_gt = self.base_dataset[original_idx] 
 
         if self.is_labeled:
-            # For labeled data: img, label (ground truth), and original_idx
             img_aug = self.transforms_w(img) if self.transforms_w else img
             return img_aug, label_gt, original_idx
         else:
-            # For unlabeled data: weak_aug_img, strong_aug_img, original_idx, prior_pseudo_label
             img_w = self.transforms_w(img) if self.transforms_w else img
             img_s = self.transforms_s(img) if self.transforms_s else img
-            y_prior = self.prior_pseudo_labels_all[original_idx] # Get PPL using global index
+            y_prior = self.prior_pseudo_labels_all[original_idx] 
             return img_w, img_s, original_idx, y_prior
 
 # --- FlexMatchThresholdingHook (copied and fixed) ---
 class FlexMatchThresholdingHook:
     def __init__(self, total_training_samples, num_classes, p_cutoff, thresh_warmup=True):
-        self.total_training_samples = total_training_samples # Total samples in the base training dataset
+        self.total_training_samples = total_training_samples 
         self.num_classes = num_classes
         self.p_cutoff = p_cutoff
         self.thresh_warmup = thresh_warmup
         
-        # Initialize selected_label to track pseudo-labels for ALL training samples (50000 for CIFAR-10)
         self.selected_label = torch.ones((self.total_training_samples,), dtype=torch.long) * -1 
         self.classwise_acc = torch.zeros((self.num_classes,))
 
     @torch.no_grad()
     def update_class_accuracy(self):
-        """
-        Updates the class-wise accuracy based on selected pseudo-labels.
-        """
-        # Ensure selected_label is on CPU for Counter, then move back to device if needed later
         selected_label_cpu = self.selected_label.cpu().tolist()
         pseudo_counter = Counter(selected_label_cpu)
 
-        # Remove -1 from the counter, as it means "unselected"
         wo_negative_one = deepcopy(pseudo_counter)
         if -1 in wo_negative_one.keys():
             wo_negative_one.pop(-1)
 
-        if len(wo_negative_one) > 0: # Check if any positive labels have been selected
+        if len(wo_negative_one) > 0: 
             max_count = max(wo_negative_one.values())
             for i in range(self.num_classes):
-                if self.thresh_warmup:
-                    self.classwise_acc[i] = pseudo_counter[i] / max_count
-                else:
-                    self.classwise_acc[i] = pseudo_counter[i] / max_count
-        else: # If no positive labels yet, all classwise_acc remain 0.0
+                self.classwise_acc[i] = pseudo_counter[i] / max_count
+        else: 
             self.classwise_acc.fill_(0.0)
 
     @torch.no_grad()
     def generate_mask(self, probs_x_ulb_w, idx_ulb_global, device):
-        """
-        Generates the mask for unlabeled data based on adaptive thresholding.
-        Args:
-            probs_x_ulb_w (torch.Tensor): Probabilities from unlabeled weak-augmented data (model prediction).
-            idx_ulb_global (torch.Tensor): Original global indices of the unlabeled batch samples (0 to 49999).
-            device (torch.device): The device (e.g., 'cuda', 'cpu') to perform operations on.
-        Returns:
-            torch.Tensor: The binary mask.
-        """
-        # Ensure selected_label and classwise_acc are on the correct device for tensor operations
-        # Move selected_label to device only if not already there, to avoid repeated moves
         if self.selected_label.device != device:
             self.selected_label = self.selected_label.to(device)
         if self.classwise_acc.device != device:
@@ -244,20 +208,14 @@ class FlexMatchThresholdingHook:
 
         max_probs, max_idx = torch.max(probs_x_ulb_w, dim=-1)
 
-        # The core FlexMatch adaptive thresholding formula (convex function)
-        # `max_idx` contains class IDs for the current batch, so `classwise_acc[max_idx]` is valid.
         threshold_per_sample = self.p_cutoff * (self.classwise_acc[max_idx] / (2. - self.classwise_acc[max_idx]))
-        mask = max_probs.ge(threshold_per_sample).float() # Mask for the current batch
+        mask = max_probs.ge(threshold_per_sample).float() 
 
-        # Update selected_label based on base p_cutoff for classwise_acc update
-        # Only samples passing the *base* p_cutoff are considered for `selected_label`
         select_for_update = max_probs.ge(self.p_cutoff)
         
         if idx_ulb_global[select_for_update == 1].nelement() != 0:
-            # Update the global `selected_label` array at the global indices
             self.selected_label[idx_ulb_global[select_for_update == 1]] = max_idx[select_for_update == 1]
         
-        # Update class-wise accuracy after potentially adding new selected labels
         self.update_class_accuracy()
 
         return mask
@@ -269,13 +227,6 @@ class FlexMatchThresholdingHook:
         }
 
     def load_state_dict(self, state_dict, device):
-        # Resize selected_label if checkpoint was saved with a different size
-        # (e.g., if total_training_samples changed, but it shouldn't here)
-        if self.selected_label.shape != state_dict['selected_label'].shape:
-            print(f"Warning: Resizing selected_label from {state_dict['selected_label'].shape} to {self.selected_label.shape}")
-            self.selected_label = torch.ones((self.total_training_samples,), dtype=torch.long) * -1 # Re-init
-            # Only copy over valid indices if resizing happened, otherwise just load.
-            # For this scenario, assuming same total_training_samples always.
         self.selected_label = state_dict['selected_label'].to(device)
         self.classwise_acc = state_dict['classwise_acc'].to(device)
 
@@ -287,14 +238,14 @@ class FlexMatchAlgorithm:
                  optimizer,
                  device,
                  num_classes: int,
-                 total_training_samples: int, # Pass total samples for hook initialization
+                 total_training_samples: int,
                  T: float = 0.5,
                  p_cutoff: float = 0.95,
                  hard_label: bool = True,
                  thresh_warmup: bool = True,
-                 lambda_u: float = 1.0, # Unsupervised loss weight
+                 lambda_u: float = 1.0, 
                  use_amp: bool = False,
-                 switching_epoch: int = 60 # AS3L switching point T
+                 switching_epoch: int = 60 
                  ):
         
         self.model = model.to(device)
@@ -302,20 +253,16 @@ class FlexMatchAlgorithm:
         self.device = device
         self.num_classes = num_classes
         
-        # FlexMatch hyperparameters
-        self.T = T # Temperature for pseudo-label sharpening
-        self.p_cutoff = p_cutoff # Base confidence threshold
-        self.hard_label = hard_label # Use hard (one-hot) or soft pseudo-labels
-        self.thresh_warmup = thresh_warmup # Warmup for adaptive thresholding
-        self.lambda_u = lambda_u # Unsupervised loss weight
+        self.T = T 
+        self.p_cutoff = p_cutoff 
+        self.hard_label = hard_label 
+        self.thresh_warmup = thresh_warmup 
+        self.lambda_u = lambda_u 
 
-        # AS3L specific
         self.switching_epoch = switching_epoch
 
-        # Loss functions
-        self.ce_loss = nn.CrossEntropyLoss(reduction='mean') # Supervised CE loss
+        self.ce_loss = nn.CrossEntropyLoss(reduction='mean') 
 
-        # Initialize FlexMatchThresholdingHook with total training samples
         self.masking_hook = FlexMatchThresholdingHook(
             total_training_samples=total_training_samples,
             num_classes=num_classes,
@@ -350,9 +297,12 @@ class FlexMatchAlgorithm:
         self.optimizer.zero_grad()
 
         x_lb, y_lb = x_lb.to(self.device), y_lb.to(self.device)
-        idx_ulb_global = idx_ulb_global.to(self.device) # Ensure global indices are on device
+        idx_ulb_global = idx_ulb_global.to(self.device)
         x_ulb_w, x_ulb_s = x_ulb_w.to(self.device), x_ulb_s.to(self.device)
         y_prior_ulb_batch = y_prior_ulb_batch.to(self.device)
+
+        # Ensure y_prior_ulb_batch is long type for F.one_hot
+        y_prior_ulb_batch = y_prior_ulb_batch.long()
 
         context_manager = torch.cuda.amp.autocast() if self.use_amp else torch.no_grad()
 
@@ -376,34 +326,25 @@ class FlexMatchAlgorithm:
         # --- Unsupervised Loss Calculation with AS3L PPL integration ---
         model_probs_x_ulb_w = self.compute_prob(logits_x_ulb_w.detach())
 
-        # Determine y_post (pseudo-label target) based on switching epoch (T)
-        if current_epoch < self.switching_epoch: # Use < to include epoch 0 to switching_epoch-1
-            y_prior_one_hot = F.one_hot(y_prior_ulb_batch.long(), num_classes=self.num_classes).float()
-            y_prior_one_hot = y_prior_one_hot.to(self.device)
-
-            # Combine y_prior and model's weak predictions as per AS3L paper Eq. (5)
-            # y_post = normalize(yprior + ypre,w)
+        if current_epoch < self.switching_epoch: 
+            y_prior_one_hot = F.one_hot(y_prior_ulb_batch, num_classes=self.num_classes).float()
+            
             combined_logits = y_prior_one_hot + model_probs_x_ulb_w 
             y_post_soft = F.normalize(combined_logits, p=1, dim=-1) # L1-normalize to sum to 1
         else:
             y_post_soft = model_probs_x_ulb_w
 
-        # Compute mask using FlexMatchThresholdingHook.
         mask = self.masking_hook.generate_mask(model_probs_x_ulb_w, idx_ulb_global, self.device)
         
-        # Generate pseudo-labels (actual target for CE or KL loss) from y_post_soft
         if self.hard_label:
             pseudo_label_target = torch.argmax(y_post_soft, dim=-1)
         else:
             pseudo_label_target = y_post_soft
 
-        # Calculate consistency loss
         unsup_loss = self.consistency_loss(logits_x_ulb_s, pseudo_label_target, mask)
 
-        # Total loss
         total_loss = sup_loss + self.lambda_u * unsup_loss
 
-        # Backpropagation
         if self.use_amp:
             self.scaler.scale(total_loss).backward()
             self.scaler.step(self.optimizer)
@@ -439,7 +380,6 @@ class FlexMatchAlgorithm:
         checkpoint = torch.load(path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        # Pass device to hook's load_state_dict so tensors are on correct device
         self.masking_hook.load_state_dict(checkpoint['flexmatch_hook_state'], self.device)
         print(f"Loaded checkpoint from {path}")
         return checkpoint
@@ -449,7 +389,6 @@ def get_as3l_ssl_datasets(data_dir, selected_labeled_indices, selected_labeled_l
     base_train_dataset = datasets.CIFAR10(root=data_dir, train=True, download=True)
     base_test_dataset = datasets.CIFAR10(root=data_dir, train=False, download=True)
     
-    # Ensure total_training_samples aligns with the loaded dataset
     assert total_training_samples == len(base_train_dataset)
     
     total_train_indices_list = list(range(total_training_samples))
@@ -457,7 +396,6 @@ def get_as3l_ssl_datasets(data_dir, selected_labeled_indices, selected_labeled_l
     selected_labeled_indices_set = set(selected_labeled_indices.tolist())
     unlabeled_indices = np.array([idx for idx in total_train_indices_list if idx not in selected_labeled_indices_set], dtype=np.int64)
 
-    # Sanity check: Ensure no overlap and sum of lengths is correct
     assert len(selected_labeled_indices_set.intersection(unlabeled_indices)) == 0
     assert len(selected_labeled_indices) + len(unlabeled_indices) == len(base_train_dataset)
     
@@ -481,25 +419,29 @@ def get_as3l_ssl_datasets(data_dir, selected_labeled_indices, selected_labeled_l
 def main_as3l_stage3():
     parser = argparse.ArgumentParser(description='AS3L Stage 3: Semi-Supervised Training Guided by Prior Pseudo-labels')
     parser.add_argument('--data_root', default='./data', type=str, help='Path to the root directory containing dataset.')
-    parser.add_argument('--fself_weights_path', default='./my_as3l_runs/simsiam_pretrain_cifar10/resnet18_backbone_fself.pth', type=str,
-                        help='Path to the pre-trained f_self backbone weights from Stage 1.')
-    parser.add_argument('--stage2_outputs_dir', default='./my_as3l_runs/as3l_stage2_outputs', type=str,
+    parser.add_argument('--encoder_weights_path', default='./output/my_as3l_runs/simsiam_pretrain_cifar10_wrn282/wrn_28_2_encoder_fself.pth', type=str,
+                        help='Path to the pre-trained SimSiam ENCODER weights (f_self) from Stage 1.')
+    parser.add_argument('--stage2_outputs_dir', default='./output/my_as3l_runs/as3l_stage2_outputs', type=str,
                         help='Directory containing outputs from Stage 2 (selected labels, prior pseudo-labels).')
-    parser.add_argument('--output_model_dir', default='./my_as3l_runs/as3l_stage3_models', type=str,
+    parser.add_argument('--output_model_dir', default='./output/my_as3l_runs/as3l_stage3_models', type=str,
                         help='Directory to save the final trained AS3L model.')
     parser.add_argument('--num_classes', default=10, type=int, help='Number of classes in the dataset.')
     parser.add_argument('--total_training_samples', default=50000, type=int, 
                         help='Total number of training samples in the base dataset (e.g., 50000 for CIFAR-10).')
     
-    # Model Architecture (changed to ResNet18 to match Stage 1)
-    parser.add_argument('--model_arch', default='resnet18', type=str, help='Model architecture for Stage 3 (must match Stage 1 for f_self loading).')
+    # Model Architecture (changed to WRN_28_2_Classifier to match Stage 1 pre-training backbone)
+    parser.add_argument('--model_arch', default='wrn_28_2', type=str, help='Model architecture for Stage 3 (must match Stage 1, e.g., wrn_28_2).')
     
     # FlexMatch Hyperparameters
     parser.add_argument('--flexmatch_T', default=0.7, type=float, help='Temperature for pseudo-label sharpening in FlexMatch.')
     parser.add_argument('--flexmatch_p_cutoff', default=0.95, type=float, help='Base confidence threshold for FlexMatch.')
     parser.add_argument('--flexmatch_lambda_u', default=7.0, type=float, help='Unsupervised loss weight (lambda_u/Mu in paper).')
-    parser.add_argument('--flexmatch_hard_label', default=True, type=bool, help='Use hard (one-hot) or soft pseudo-labels for consistency loss.')
-    parser.add_argument('--flexmatch_thresh_warmup', default=True, type=bool, help='Use threshold warm-up in FlexMatch.')
+    parser.add_argument('--flexmatch_hard_label', action='store_true', help='Use hard (one-hot) pseudo-labels for consistency loss.')
+    parser.add_argument('--flexmatch_soft_label', dest='flexmatch_hard_label', action='store_false', help='Use soft pseudo-labels for consistency loss.')
+    parser.set_defaults(flexmatch_hard_label=True) # Default to hard labels
+    parser.add_argument('--flexmatch_thresh_warmup', action='store_true', help='Use threshold warm-up in FlexMatch.')
+    parser.add_argument('--no_flexmatch_thresh_warmup', dest='flexmatch_thresh_warmup', action='store_false', help='Do NOT use threshold warm-up.')
+    parser.set_defaults(flexmatch_thresh_warmup=True) # Default to True
     parser.add_argument('--as3l_switching_epoch', default=60, type=int, help='AS3L switching point T (in epochs).')
     
     # Training Hyperparameters
@@ -509,15 +451,21 @@ def main_as3l_stage3():
     parser.add_argument('--learning_rate', default=0.03, type=float, help='Initial learning rate.')
     parser.add_argument('--momentum', default=0.9, type=float, help='Momentum for SGD optimizer.')
     parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay for regularization.')
-    parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision.') # Changed to action='store_true' for boolean flags
+    parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision.')
     parser.add_argument('--no_amp', dest='use_amp', action='store_false', help='Do NOT use Automatic Mixed Precision.')
-    parser.set_defaults(use_amp=True) # Default to True unless --no_amp is present
+    parser.set_defaults(use_amp=True)
     parser.add_argument('--num_workers', default=4, type=int, help='Number of data loading workers.')
     parser.add_argument('--print_freq', default=100, type=int, help='Frequency to print training progress (in steps).')
     parser.add_argument('--eval_freq_epochs', default=5, type=int, help='Frequency to evaluate on test set (in epochs).')
-    parser.add_argument('--gpu', default=0, type=int, help='GPU index to use. Set to -1 for CPU.') # Changed default to -1 for clearer CPU intent
-
+    parser.add_argument('--gpu', default=0, type=int, help='GPU index to use. Set to -1 for CPU.')
+    parser.add_argument('--seed', default=42, type=int, help='Random seed for reproducibility.') 
+    # NEW ARGUMENT FOR WANDB NAME GENERATION:
+    parser.add_argument('--num_labeled_samples_per_class', default=10, type=int, 
+                        help='Number of labeled samples per class (needed for WandB name).') 
+    
     args = parser.parse_args()
+    
+    set_seed(args.seed) # Set seed after parsing arguments, using args.seed
 
     # Device configuration
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() and args.gpu != -1 else "cpu")
@@ -525,6 +473,17 @@ def main_as3l_stage3():
 
     # Ensure output directory exists
     os.makedirs(args.output_model_dir, exist_ok=True)
+
+    # Initialize WandB run
+    wandb.init(
+        mode="online",
+        project="AS3L_CIFAR10", # Your WandB project name
+        entity="k-yogendra", # <--- REPLACE WITH YOUR WANDB USERNAME/TEAM NAME
+        config=args, # Logs all argparse arguments
+        name=f"AS3L_L{args.num_labeled_samples_per_class}_Mu{args.flexmatch_lambda_u}_T{args.as3l_switching_epoch}_Epochs{args.epochs}" # Custom run name
+    )
+    print(f"WandB run initialized: {wandb.run.url}")
+
 
     print("--- AS3L Stage 3: Semi-Supervised Training Guided by Prior Pseudo-labels ---")
 
@@ -551,26 +510,29 @@ def main_as3l_stage3():
     
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=args.num_workers)
 
-    # 3. Initialize ResNet18 model (matching Stage 1 architecture)
-    model = ResNet18(num_classes=args.num_classes)
+    # 3. Initialize WideResNet Classifier
+    model = WRN_28_2_Classifier(num_classes=args.num_classes)
     model.to(device)
 
-    # 4. Load f_self weights from Stage 1 into ResNet18 backbone (excluding FC layer)
-    print(f"Loading f_self weights from {args.fself_weights_path} into ResNet18 backbone...")
-    fself_state_dict = torch.load(args.fself_weights_path, map_location=device)
+    # 4. Load f_self weights from Stage 1 into the WideResNet Classifier backbone
+    print(f"Loading f_self weights from {args.encoder_weights_path} into WRN-28-2 backbone...")
+    encoder_state_dict = torch.load(args.encoder_weights_path, map_location=device)
     
     model_state_dict = model.state_dict()
     loaded_keys = 0
-    # Iterate through f_self weights and load only matching backbone layers
-    for key, value in fself_state_dict.items():
-        # Exclude the final 'fc' layer (SimSiam's ResNet has an 'fc' before its projection head)
-        if 'fc' not in key and key in model_state_dict and model_state_dict[key].shape == value.shape:
-            model_state_dict[key] = value
-            loaded_keys += 1
-        # else: # Optional: print keys that are skipped for debugging
-        #     print(f"Skipping key {key} from f_self: not a backbone layer or shape mismatch.")
+    
+    for key, value in encoder_state_dict.items():
+        if key.startswith('backbone.'):
+            new_key = key[len('backbone.'):]
             
-    model.load_state_dict(model_state_dict) # Load modified state dict
+            if new_key.startswith('fc'): 
+                continue
+
+            if new_key in model_state_dict and model_state_dict[new_key].shape == value.shape:
+                model_state_dict[new_key] = value
+                loaded_keys += 1
+            
+    model.load_state_dict(model_state_dict) 
     print(f"Loaded {loaded_keys} parameters from f_self backbone.")
 
     # 5. Setup Optimizer and Learning Rate Scheduler
@@ -585,7 +547,7 @@ def main_as3l_stage3():
         optimizer=optimizer,
         device=device,
         num_classes=args.num_classes,
-        total_training_samples=args.total_training_samples, # Pass total samples
+        total_training_samples=args.total_training_samples,
         T=args.flexmatch_T,
         p_cutoff=args.flexmatch_p_cutoff,
         hard_label=args.flexmatch_hard_label,
@@ -602,7 +564,6 @@ def main_as3l_stage3():
     for epoch in range(args.epochs):
         flexmatch_algo.model.train()
         
-        # Reset iterators for each epoch
         labeled_iter = iter(labeled_loader)
         unlabeled_iter = iter(unlabeled_loader)
 
@@ -614,22 +575,17 @@ def main_as3l_stage3():
 
         for batch_idx in range(len(unlabeled_loader)):
             try:
-                x_lb, y_lb, _ = next(labeled_iter) # _ for original_idx
+                x_lb, y_lb, _ = next(labeled_iter)
             except StopIteration:
                 labeled_iter = iter(labeled_loader)
                 x_lb, y_lb, _ = next(labeled_iter)
             
-            # idx_ulb is original_idx (global index)
             x_ulb_w, x_ulb_s, idx_ulb_global, y_prior_ulb_batch = next(unlabeled_iter)
 
             log_dict = flexmatch_algo.train_step(
                 x_lb, y_lb, idx_ulb_global, x_ulb_w, x_ulb_s, epoch, y_prior_ulb_batch
             )
             
-            # The warning "Detected call of `lr_scheduler.step()` before `optimizer.step()`" is common.
-            # For cosine annealing with step-wise updates, it's often placed after optimizer.step().
-            # If `warnings.warn("Detected call of `lr_scheduler.step()` before `optimizer.step()`" ...)`
-            # is annoying, you can safely ignore it or switch the order if it fits your scheduler.
             scheduler.step() 
 
             total_loss_epoch += log_dict['total_loss']
@@ -647,6 +603,16 @@ def main_as3l_stage3():
                       f"Util Ratio = {log_dict['util_ratio']:.4f}, "
                       f"Classwise Acc (avg) = {log_dict['classwise_acc']:.4f}, "
                       f"LR = {scheduler.get_last_lr()[0]:.6f}")
+                # Log to WandB at each print_freq step
+                wandb.log({
+                    "train/total_loss": log_dict['total_loss'],
+                    "train/sup_loss": log_dict['sup_loss'],
+                    "train/unsup_loss": log_dict['unsup_loss'],
+                    "train/util_ratio": log_dict['util_ratio'],
+                    "train/classwise_acc_avg": log_dict['classwise_acc'],
+                    "train/learning_rate": scheduler.get_last_lr()[0]
+                }, step=global_step)
+
 
         avg_total_loss = total_loss_epoch / num_batches
         avg_sup_loss = total_sup_loss_epoch / num_batches
@@ -659,7 +625,15 @@ def main_as3l_stage3():
               f"Avg Unsup Loss = {avg_unsup_loss:.4f}, "
               f"Avg Util Ratio = {avg_util_ratio:.4f}, "
               f"Current Classwise Acc (avg) = {flexmatch_algo.masking_hook.classwise_acc.mean().item():.4f}")
-        
+        # Log epoch summary to WandB
+        wandb.log({
+            "epoch_summary/avg_total_loss": avg_total_loss,
+            "epoch_summary/avg_sup_loss": avg_sup_loss,
+            "epoch_summary/avg_unsup_loss": avg_unsup_loss,
+            "epoch_summary/avg_util_ratio": avg_util_ratio,
+            "epoch_summary/current_classwise_acc_avg": flexmatch_algo.masking_hook.classwise_acc.mean().item()
+        }, step=global_step) 
+
         # --- Evaluation ---
         if (epoch + 1) % args.eval_freq_epochs == 0:
             flexmatch_algo.model.eval()
@@ -674,15 +648,42 @@ def main_as3l_stage3():
             
             accuracy = 100 * correct / total
             print(f"Test Accuracy after Epoch {epoch+1}: {accuracy:.2f}%")
+            # Log test accuracy to WandB
+            wandb.log({"test/accuracy": accuracy}, step=global_step) 
 
             if accuracy > best_test_acc:
                 best_test_acc = accuracy
                 checkpoint_path = os.path.join(args.output_model_dir, "as3l_best_model.pth")
                 flexmatch_algo.save_checkpoint(checkpoint_path)
                 print(f"New best model saved to {checkpoint_path} with accuracy: {best_test_acc:.2f}%")
+                # Also save the best model to WandB
+                wandb.save(checkpoint_path)
         
     print(f"Training finished. Best Test Accuracy: {best_test_acc:.2f}%")
     print("--- AS3L Stage 3 Completed Successfully ---")
 
+    wandb.finish() # End the WandB run
+
+
 if __name__ == "__main__":
     main_as3l_stage3()
+
+
+# python as3l_stage3.py \
+#     --data_root ./data \
+#     --encoder_weights_path ./output/my_as3l_runs/simsiam_pretrain_cifar10_wrn282/wrn_28_2_encoder_fself.pth \
+#     --stage2_outputs_dir ./output/my_as3l_runs/as3l_stage2_outputs \
+#     --output_model_dir ./output/my_as3l_runs/as3l_stage3_models \
+#     --num_classes 10 \
+#     --total_training_samples 50000 \
+#     --model_arch wrn_28_2 \
+#     --flexmatch_lambda_u 7.0 \
+#     --as3l_switching_epoch 60 \
+#     --epochs 200 \
+#     --labeled_batch_size 64 \
+#     --unlabeled_batch_size_ratio 7 \
+#     --learning_rate 0.03 \
+#     --weight_decay 5e-4 \
+#     --gpu 0 \
+#     --num_workers 4 \
+#     --use_amp # Or --no_amp if you prefer not to use mixed precision

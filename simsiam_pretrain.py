@@ -18,36 +18,21 @@ from PIL import ImageFilter, Image
 # --- 1. Data Augmentation and Transforms ---
 
 class TwoCropsTransform:
-    """
-    A transformation class to create two different random crops of the same image.
-    This is used to generate a query (q) and key (k) pair for contrastive learning.
-    """
-
     def __init__(self, base_transform):
-        # Initialize with a base transformation (e.g., augmentation pipeline).
         self.base_transform = base_transform
 
     def __call__(self, x):
-        # Apply the base transformation twice to produce two augmented views.
-        q = self.base_transform(x)  # First crop (query)
-        k = self.base_transform(x)  # Second crop (key)
-        return [q, k]  # Return as a list of query and key
+        q = self.base_transform(x)
+        k = self.base_transform(x)
+        return [q, k]
 
 
 class GaussianBlur(object):
-    """
-    Apply Gaussian blur as an augmentation.
-    This is inspired by SimCLR: https://arxiv.org/abs/2002.05709.
-    """
-
     def __init__(self, sigma=[.1, 2.]):
-        # Define the range for the standard deviation (sigma) of the Gaussian kernel.
         self.sigma = sigma
 
     def __call__(self, x):
-        # Randomly select a sigma value within the defined range.
         sigma = random.uniform(self.sigma[0], self.sigma[1])
-        # Apply Gaussian blur with the selected radius to the input image.
         x = x.filter(ImageFilter.GaussianBlur(radius=sigma))
         return x
 
@@ -56,10 +41,6 @@ class GaussianBlur(object):
 # Reference: https://github.com/meliketoy/wide-resnet.pytorch/blob/master/models/wideresnet.py
 
 class WideBasicBlock(nn.Module):
-    """
-    Wide Residual Network Basic Block.
-    Differs from standard BasicBlock by increasing the number of filters by a widen_factor.
-    """
     def __init__(self, in_planes, out_planes, stride, dropRate=0.0):
         super(WideBasicBlock, self).__init__()
         self.bn1 = nn.BatchNorm2d(in_planes)
@@ -76,42 +57,25 @@ class WideBasicBlock(nn.Module):
                                                                     padding=0, bias=False) or None
 
     def forward(self, x):
-        # Store initial x for shortcut later
-        shortcut = x 
+        out = self.relu1(self.bn1(x)) # Apply BN1 and ReLU1 to the input 'x'
         
-        # First BN-ReLU sequence
-        # Apply BN1 and ReLU1 to the input 'x' always
-        out = self.relu1(self.bn1(x))
-        
-        # If channels are not equal, apply shortcut convolution *before* the main path's first conv
-        # The original WRN implementation processes 'x' through BN1/ReLU1 *then* applies conv1
-        # and also transforms 'x' for the shortcut path.
+        shortcut = out # Default shortcut is activated input
         if not self.equal_channels:
-            shortcut = self.convShortcut(out) # Apply shortcut to the *activated* input (out) if channels change
-            # After this point, 'out' already holds the result of relu1(bn1(x)), 
-            # so it should be used for the first conv layer.
+            shortcut = self.convShortcut(out) # If channels change, apply conv shortcut to activated input
         
-        # Main path through conv1 and its BN/ReLU
-        out = self.relu2(self.bn2(self.conv1(out))) # Use 'out' from the previous step
+        out = self.relu2(self.bn2(self.conv1(out))) # Main path through conv1 and its BN/ReLU
         
-        # Dropout
         if self.droprate > 0:
             out = F.dropout(out, p=self.droprate, training=self.training)
             
-        # Second conv layer
         out = self.conv2(out)
         
-        # Add shortcut connection
-        out = torch.add(shortcut, out) # Add the stored 'shortcut' (which might be convShortcut(out from previous step)) to the main path output
+        out = torch.add(shortcut, out)
         
         return out
 
 
 class WideResNet(nn.Module):
-    """
-    Wide Residual Network (WRN) as used in the paper.
-    WRN-28-2 means 28 layers deep and a widen_factor of 2.
-    """
     def __init__(self, depth, widen_factor, dropRate=0.0):
         super(WideResNet, self).__init__()
         self.in_planes = 16
@@ -129,9 +93,6 @@ class WideResNet(nn.Module):
         self.bn1 = nn.BatchNorm2d(nStages[3])
         self.relu = nn.ReLU(inplace=True)
 
-        # The SimSiam paper (and your original script's ResNet) use a final FC layer
-        # This layer acts as the feature extractor 'backbone' output
-        # For WRN-28-2, nStages[3] is 64 * 2 = 128
         self.fc = nn.Linear(nStages[3], nStages[3]) # Output dimension is the same as the last conv block's channels
 
         for m in self.modules():
@@ -158,140 +119,62 @@ class WideResNet(nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.relu(self.bn1(out))
-        # Global average pooling (input size 32x32 -> 8x8 after 2 stride-2 layers)
-        # 32 / (2*2) = 8
         out = F.avg_pool2d(out, 8) 
         out = out.view(out.size(0), -1)
-        out = self.fc(out) # Final feature output
+        out = self.fc(out)
         return out
 
 def WRN_28_2():
-    """Returns a Wide ResNet 28-2 model."""
     return WideResNet(depth=28, widen_factor=2)
 
 
 # --- 3. SimSiam Specific Modules ---
 
 class SimSiamLoss(nn.Module):
-    """
-    Implementation of the SimSiam loss function.
-    This loss is designed for self-supervised learning by comparing the similarity
-    between pairs of projections and predictions from two augmented views of the same image.
-
-    Reference:
-    SimSiam: Exploring Simple Siamese Representation Learning (https://arxiv.org/abs/2011.10566)
-    """
-
     def __init__(self, version='simplified'):
-        """
-        Initialize the SimSiam loss module.
-
-        Args:
-            version (str): Specifies the version of the loss.
-                           'original' uses the original dot-product-based formulation,
-                           'simplified' uses cosine similarity (default).
-        """
         super().__init__()
         self.ver = version
 
     def asymmetric_loss(self, p, z):
-        """
-        Compute the asymmetric loss between the prediction (p) and the projection (z).
-        This enforces similarity between the two while detaching the gradient from `z`.
-
-        Args:
-            p (torch.Tensor): Prediction vector.
-            z (torch.Tensor): Projection vector.
-
-        Returns:
-            torch.Tensor: Computed loss.
-        """
         if self.ver == 'original':
-            # Detach z to stop gradient flow
             z = z.detach()
-
-            # Normalize vectors
             p = nn.functional.normalize(p, dim=1)
             z = nn.functional.normalize(z, dim=1)
-
-            # Original formulation: negative dot product
             return -(p * z).sum(dim=1).mean()
-
         elif self.ver == 'simplified':
-            # Detach z to stop gradient flow
             z = z.detach()
-
-            # Simplified formulation: negative cosine similarity
             return -nn.functional.cosine_similarity(p, z, dim=-1).mean()
 
     def forward(self, z1, z2, p1, p2):
-        """
-        Compute the SimSiam loss for two pairs of projections and predictions.
-
-        Args:
-            z1 (torch.Tensor): Projection vector from the first augmented view.
-            z2 (torch.Tensor): Projection vector from the second augmented view.
-            p1 (torch.Tensor): Prediction vector corresponding to z1.
-            p2 (torch.Tensor): Prediction vector corresponding to z2.
-
-        Returns:
-            torch.Tensor: Averaged SimSiam loss.
-        """
-        # Compute the loss for each pair (p1, z2) and (p2, z1)
         loss1 = self.asymmetric_loss(p1, z2)
         loss2 = self.asymmetric_loss(p2, z1)
-
-        # Average the two losses
         return 0.5 * loss1 + 0.5 * loss2
 
 
 class projection_MLP(nn.Module):
-    """
-    Multi-Layer Perceptron (MLP) for projection in SimSiam.
-    This module projects the backbone's output to a feature space for contrastive learning.
-
-    Args:
-        in_dim (int): Input feature dimension.
-        out_dim (int): Output feature dimension.
-        num_layers (int): Number of layers in the MLP (default: 2).
-    """
     def __init__(self, in_dim, out_dim, num_layers=2):
         super().__init__()
-        # SimSiam uses a hidden dimension that's the same as the output dimension (2048)
         hidden_dim = out_dim 
         self.num_layers = num_layers
 
-        # First layer: Fully connected + BatchNorm + ReLU
         self.layer1 = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True)
         )
 
-        # Second layer (optional, for 3-layer MLP): Fully connected + BatchNorm + ReLU
         self.layer2 = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True)
         )
 
-        # Third layer (or second if num_layers=2): Fully connected + BatchNorm without learnable affine parameters
-        # affine=False is a key SimSiam detail
         self.layer3 = nn.Sequential(
             nn.Linear(hidden_dim, out_dim),
             nn.BatchNorm1d(out_dim, affine=False)
         )
 
     def forward(self, x):
-        """
-        Forward pass through the projection MLP.
-
-        Args:
-            x (torch.Tensor): Input features.
-
-        Returns:
-            torch.Tensor: Projected features.
-        """
         if self.num_layers == 2:
             x = self.layer1(x)
             x = self.layer3(x)
@@ -303,134 +186,73 @@ class projection_MLP(nn.Module):
 
 
 class prediction_MLP(nn.Module):
-    """
-    MLP for prediction in SimSiam.
-    Maps the projected features to the prediction space.
-
-    Args:
-        in_dim (int): Input feature dimension (default: 2048, matches projection out_dim).
-    """
     def __init__(self, in_dim=2048):
         super().__init__()
-        out_dim = in_dim  # Output dimension matches input dimension
-        # Hidden dimension is typically 1/4 of input dimension
+        out_dim = in_dim
         hidden_dim = int(out_dim / 4)
 
-        # First layer: Fully connected + BatchNorm + ReLU
         self.layer1 = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True)
         )
 
-        # Second layer: Fully connected (no activation)
         self.layer2 = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, x):
-        """
-        Forward pass through the prediction MLP.
-
-        Args:
-            x (torch.Tensor): Input features.
-
-        Returns:
-            torch.Tensor: Predicted features.
-        """
         x = self.layer1(x)
         x = self.layer2(x)
         return x
 
 
 class SimSiam(nn.Module):
-    """
-    SimSiam network implementation.
-    Combines a backbone, a projection MLP, and a prediction MLP for self-supervised learning.
-
-    Args:
-        args (Namespace): Configuration arguments for the model.
-    """
     def __init__(self, args):
         super(SimSiam, self).__init__()
-        # Initialize the backbone
         self.backbone = SimSiam.get_backbone(args.arch)
         
-        # Get the output dimension of the backbone *before* replacing its head.
-        # For the provided WRN-28-2, the output of the conv layers before FC is nStages[3] (64*k=128).
-        # The `self.backbone.fc` is a linear layer with input `nStages[3]`
         backbone_out_dim = self.backbone.fc.in_features 
 
-        # Remove the fully connected layer from the backbone as SimSiam doesn't use it directly
-        # The features before the original FC layer are what we project.
         self.backbone.fc = nn.Identity() 
 
-        # Initialize the projection MLP
         self.projector = projection_MLP(backbone_out_dim, args.feat_dim, args.num_proj_layers)
 
-        # Combine backbone and projector into a single encoder
         self.encoder = nn.Sequential(
             self.backbone,
             self.projector
         )
 
-        # Initialize the prediction MLP
         self.predictor = prediction_MLP(args.feat_dim)
 
     @staticmethod
     def get_backbone(backbone_name):
-        """
-        Retrieve the backbone model based on the specified architecture.
-        """
         if backbone_name == 'wrn_28_2':
             return WRN_28_2()
         else:
             raise ValueError(f"Unsupported backbone architecture: {backbone_name}")
 
     def forward(self, im_aug1, im_aug2):
-        """
-        Forward pass through the SimSiam model.
-
-        Args:
-            im_aug1 (torch.Tensor): Augmented view 1 of the input image batch.
-            im_aug2 (torch.Tensor): Augmented view 2 of the input image batch.
-
-        Returns:
-            dict: Output projections and predictions for both views.
-                  Keys: 'z1', 'z2', 'p1', 'p2'
-        """
-        # Pass the first augmented view through the encoder
         z1 = self.encoder(im_aug1)
-        # Pass the second augmented view through the encoder
         z2 = self.encoder(im_aug2)
 
-        # Predict features for both views
         p1 = self.predictor(z1)
         p2 = self.predictor(z2)
 
-        # Return projections and predictions
         return {'z1': z1, 'z2': z2, 'p1': p1, 'p2': p2}
 
 
 # --- 4. KNN Validation for Evaluation ---
 class KNNValidation(object):
-    """
-    Perform K-Nearest Neighbors (KNN) validation for self-supervised learning.
-    This evaluates the learned representations by checking how well the model
-    can classify images using KNN on feature embeddings.
-    """
-
-    def __init__(self, args, model, K=1):
-        self.model = model
-        self.device = torch.device('cuda' if next(model.parameters()).is_cuda else 'cpu')
+    def __init__(self, args, model_encoder, K=1): # Now accepts the encoder directly
+        self.model = model_encoder # This is the backbone + projector (encoder)
+        self.device = torch.device('cuda' if next(model_encoder.parameters()).is_cuda else 'cpu')
         self.args = args
         self.K = K
 
-        # Define base transformations for preprocessing CIFAR-10 dataset
         base_transforms = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),  # CIFAR-10 normalization
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
         ])
 
-        # Load CIFAR-10 training dataset
         train_dataset = datasets.CIFAR10(root=args.data_root,
                                          train=True,
                                          download=True,
@@ -438,12 +260,11 @@ class KNNValidation(object):
 
         self.train_dataloader = DataLoader(train_dataset,
                                            batch_size=args.batch_size,
-                                           shuffle=False,  # No shuffle for consistent feature extraction
+                                           shuffle=False,
                                            num_workers=args.num_workers,
                                            pin_memory=True,
-                                           drop_last=False) # Changed to False to use all data for KNN features
+                                           drop_last=False)
 
-        # Load CIFAR-10 validation dataset
         val_dataset = datasets.CIFAR10(root=args.data_root,
                                        train=False,
                                        download=True,
@@ -454,24 +275,19 @@ class KNNValidation(object):
                                          shuffle=False,
                                          num_workers=args.num_workers,
                                          pin_memory=True,
-                                         drop_last=False) # Changed to False to use all data for KNN evaluation
+                                         drop_last=False)
 
     def _topk_retrieval(self):
-        """
-        Extract features from the validation dataset and perform KNN search on
-        the training dataset features to classify validation images.
-        """
-        self.model.eval()  # Set model to evaluation mode
+        self.model.eval()
         if str(self.device) == 'cuda':
-            torch.cuda.empty_cache()  # Clear GPU cache for efficient memory usage
+            torch.cuda.empty_cache()
 
-        # Collect all training features and labels
         train_features = []
         train_labels = []
         with torch.no_grad():
             for inputs, targets in self.train_dataloader:
                 inputs = inputs.to(self.device)
-                features = self.model(inputs)
+                features = self.model(inputs) # Use the encoder directly
                 features = nn.functional.normalize(features, dim=1) # L2 normalize
                 train_features.append(features)
                 train_labels.append(targets.to(self.device))
@@ -484,67 +300,40 @@ class KNNValidation(object):
         with torch.no_grad():
             for batch_idx, (inputs, targets) in enumerate(self.val_dataloader):
                 targets = targets.cuda(non_blocking=True)
-                batch_size = inputs.size(0)
-
-                # Extract features for validation inputs
-                features = self.model(inputs.to(self.device))
+                
+                features = self.model(inputs.to(self.device)) # Use the encoder directly
                 features = nn.functional.normalize(features, dim=1) # L2 normalize
 
-                # Compute pairwise cosine similarity between validation and training features
-                # dist will be (batch_size_val, num_train_samples)
                 dist = torch.mm(features, train_features.t())
 
-                # Retrieve top-K neighbors
-                # yd: distances, yi: indices of top-K neighbors in train_features
                 yd, yi = dist.topk(self.K, dim=1, largest=True, sorted=True)
 
-                # Get corresponding labels of top-K neighbors
-                # retrieval will be (batch_size_val, K)
-                # Ensure train_labels is correctly broadcastable
-                retrieval = train_labels[yi] # This will directly get labels based on indices 'yi'
+                retrieval = train_labels[yi]
 
-                # Predict class by majority vote among KNN, or just use top-1 neighbor's label
-                # For K=1, this is simple. For K > 1, you'd want a majority vote.
-                # For K=1, the previous logic was fine: retrieval = retrieval.narrow(1, 0, 1).squeeze(1)
-                # For K > 1, you need majority vote:
                 if self.K > 1:
-                    # For each row (val sample), count occurrences of each label in its K neighbors
-                    # Mode returns (values, indices) where values are the most frequent ones
                     predicted_labels, _ = torch.mode(retrieval, dim=1) 
                 else: # K=1
                     predicted_labels = retrieval.squeeze(1)
 
-
-                # Update total and correct predictions
                 total += targets.size(0)
                 correct += predicted_labels.eq(targets.data).sum().item()
 
-        # Compute top-1 accuracy
         top1 = correct / total
         return top1
 
     def eval(self):
-        """
-        Public method to evaluate the model using KNN validation.
-        """
         return self._topk_retrieval()
 
 
 # --- 5. Training Utilities ---
 
 def adjust_learning_rate(optimizer, epoch, args):
-    """
-    Adjust the learning rate using a cosine annealing schedule.
-    """
     lr = args.learning_rate * 0.5 * (1. + math.cos(math.pi * epoch / args.epochs))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
 
 class AverageMeter(object):
-    """
-    Helper class to compute and store the average and current value of metrics.
-    """
     def __init__(self, name, fmt=':f'):
         self.name = name
         self.fmt = fmt
@@ -555,50 +344,28 @@ class AverageMeter(object):
         self.reset()
 
     def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
+        self.val = 0; self.avg = 0; self.sum = 0; self.count = 0
     def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
+        self.val = val; self.sum += val * n; self.count += n; self.avg = self.sum / self.count
     def __str__(self):
-        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
-        return fmtstr.format(**self.__dict__)
+        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'; return fmtstr.format(**self.__dict__)
 
 
 class ProgressMeter(object):
-    """
-    Helper class to display progress during training or validation.
-    """
     def __init__(self, num_batches, meters, prefix=""):
-        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
-        self.meters = meters
-        self.prefix = prefix
-
+        self.batch_fmtstr = self._get_batch_fmtstr(num_batches); self.meters = meters; self.prefix = prefix
     def display(self, batch):
-        entries = [self.prefix + self.batch_fmtstr.format(batch)]
-        entries += [str(meter) for meter in self.meters]
-        print('\t'.join(entries))
-
+        entries = [self.prefix + self.batch_fmtstr.format(batch)]; entries += [str(meter) for meter in self.meters]; print('\t'.join(entries))
     def _get_batch_fmtstr(self, num_batches):
-        num_digits = len(str(num_batches // 1))
-        fmt = '{:' + str(num_digits) + 'd}'
-        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
+        num_digits = len(str(num_batches // 1)); fmt = '{:' + str(num_digits) + 'd}'; return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
 
-def save_checkpoint(epoch, model, optimizer, acc, filename, msg):
-    """
-    Save full SimSiam model checkpoint (including backbone, projector, predictor).
-    """
+def save_checkpoint(epoch, model_encoder, model_predictor, optimizer, acc, filename, msg): # Pass encoder and predictor separately
     state = {
         'epoch': epoch,
         'arch': args.arch,
-        'state_dict': model.state_dict(), # Saves the full SimSiam model state_dict
+        'encoder_state_dict': model_encoder.state_dict(), # Save encoder
+        'predictor_state_dict': model_predictor.state_dict(), # Save predictor
         'optimizer': optimizer.state_dict(),
         'top1_acc': acc
     }
@@ -606,53 +373,45 @@ def save_checkpoint(epoch, model, optimizer, acc, filename, msg):
     print(msg)
 
 
-def load_checkpoint(model, optimizer, filename, gpu_id):
-    """
-    Load model checkpoint.
-    """
+def load_checkpoint(model_encoder, model_predictor, optimizer, filename, gpu_id): # Load encoder and predictor
     map_location = f'cuda:{gpu_id}' if gpu_id is not None else 'cpu'
     checkpoint = torch.load(filename, map_location=map_location)
     start_epoch = checkpoint['epoch']
-    model.load_state_dict(checkpoint['state_dict'])
+    model_encoder.load_state_dict(checkpoint['encoder_state_dict'])
+    model_predictor.load_state_dict(checkpoint['predictor_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer'])
-    return start_epoch, model, optimizer
+    return start_epoch, model_encoder, model_predictor, optimizer
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
-    """
-    Train the SimSiam model for one epoch.
-    """
-    batch_time = AverageMeter('Time', ':6.3f')  # Measure batch processing time
-    losses = AverageMeter('Loss', ':.4e')  # Track average loss
+    batch_time = AverageMeter('Time', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
     progress = ProgressMeter(
         len(train_loader),
         [batch_time, losses],
         prefix="Epoch: [{}]".format(epoch))
 
-    model.train()  # Set model to training mode
+    model.train()
     end = time.time()
     for i, (images, _) in enumerate(train_loader):
         if args.gpu is not None:
             images[0] = images[0].cuda(args.gpu, non_blocking=True)
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
 
-        # Forward pass through the model
         outs = model(im_aug1=images[0], im_aug2=images[1])
-        loss = criterion(outs['z1'], outs['z2'], outs['p1'], outs['p2'])  # Compute SimSiam loss
+        loss = criterion(outs['z1'], outs['z2'], outs['p1'], outs['p2'])
 
-        # Backpropagation and optimization
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # Update loss and batch time
         losses.update(loss.item(), images[0].size(0))
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:  # Display progress periodically
+        if i % args.print_freq == 0:
             progress.display(i)
 
-    return losses.avg  # Return average loss
+    return losses.avg
 
 
 # --- 6. Main Function and Argparse Setup ---
@@ -667,7 +426,7 @@ parser.add_argument('--feat_dim', default=2048, type=int, help='Dimensionality o
 parser.add_argument('--num_proj_layers', default=2, type=int, help='Number of layers in the projection MLP (2 or 3).')
 parser.add_argument('--batch_size', default=512, type=int, help='Batch size for training and validation.')
 parser.add_argument('--num_workers', default=4, type=int, help='Number of data loading workers.')
-parser.add_argument('--epochs', default=800, type=int, help='Number of training epochs.')
+parser.add_argument('--epochs', default=800, type=int, help='Number of training epochs.') # Increased to 800
 parser.add_argument('--gpu', default=0, type=int, help='GPU index to use for training (e.g., 0 for the first GPU).')
 parser.add_argument('--loss_version', default='original', type=str, help='Version of the loss function (\'simplified\' or \'original\').')
 parser.add_argument('--print_freq', default=10, type=int, help='Frequency (in batches) to print training progress.')
@@ -677,22 +436,18 @@ parser.add_argument('--resume', default=None, type=str, help='Path to a checkpoi
 parser.add_argument('--learning_rate', default=0.06, type=float, help='Initial learning rate for the optimizer.')
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay for regularization.')
 parser.add_argument('--momentum', default=0.9, type=float, help='Momentum for the SGD optimizer.')
-parser.add_argument('--backbone_output_path', type=str,
-                    help='Path to save the pre-trained backbone weights (f_self). Auto-generated if not provided.')
+parser.add_argument('--encoder_output_path', type=str,
+                    help='Path to save the pre-trained encoder weights (f_self). Auto-generated if not provided.')
 
 
 args = parser.parse_args()
 
-# Auto-generate backbone_output_path if not provided
-if args.backbone_output_path is None:
-    args.backbone_output_path = path.join(args.exp_dir, args.trial, f"{args.arch}_backbone_fself.pth")
+# Auto-generate encoder_output_path if not provided
+if args.encoder_output_path is None:
+    args.encoder_output_path = path.join(args.exp_dir, args.trial, f"{args.arch}_encoder_fself.pth")
 
 
 def main():
-    """
-    Main function to set up training and validation for SimSiam.
-    Handles directory creation, data preparation, model setup, training loop, and checkpointing.
-    """
     # Create experiment directory if it doesn't exist
     if not path.exists(args.exp_dir):
         makedirs(args.exp_dir)
@@ -702,24 +457,20 @@ def main():
     if not path.exists(trial_dir):
         makedirs(trial_dir)
     logger = SummaryWriter(trial_dir)
-    print("Parsed Arguments:", vars(args))  # Print experiment configuration
+    print("Parsed Arguments:", vars(args))
 
-    # Define data augmentation for training
-    # SimSiam uses common augmentations, slightly different from typical supervised CIFAR.
-    # The random resized crop (20-100% scale) helps in learning more robust features.
     train_transforms = transforms.Compose([
         transforms.RandomResizedCrop(args.img_dim, scale=(0.2, 1.)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomApply([
-            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # Random brightness, contrast, saturation, hue
+            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
         ], p=0.8),
         transforms.RandomGrayscale(p=0.2),
-        GaussianBlur(sigma=[.1, 2.]), # Added Gaussian Blur as per SimSiam paper
+        GaussianBlur(sigma=[.1, 2.]),
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))  # CIFAR-10 mean and std
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
     ])
 
-    # Load CIFAR-10 training dataset with TwoCropsTransform for SimSiam
     train_set = datasets.CIFAR10(root=args.data_root,
                                  train=True,
                                  download=True,
@@ -732,84 +483,82 @@ def main():
                               pin_memory=True,
                               drop_last=True)
 
-    # Initialize SimSiam model
     model = SimSiam(args)
 
-    # Define SGD optimizer with momentum and weight decay
     optimizer = optim.SGD(model.parameters(),
                           lr=args.learning_rate,
                           momentum=args.momentum,
                           weight_decay=args.weight_decay)
 
-    # Initialize loss function (original or simplified version)
     criterion = SimSiamLoss(args.loss_version)
 
-    # Move model and loss to GPU if available
     if args.gpu is not None and torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
         criterion = criterion.cuda(args.gpu)
-        cudnn.benchmark = True  # Enable auto-tuning for faster training
+        cudnn.benchmark = True
     elif args.gpu is not None and not torch.cuda.is_available():
         print(f"Warning: GPU {args.gpu} requested but CUDA is not available. Using CPU.")
-        args.gpu = None # Set to None to prevent further CUDA calls
+        args.gpu = None
 
-    # Resume from a checkpoint if provided
     start_epoch = 1
     if args.resume is not None:
         if path.isfile(args.resume):
-            start_epoch, model, optimizer = load_checkpoint(model, optimizer, args.resume, args.gpu)
+            start_epoch, model.encoder, model.predictor, optimizer = load_checkpoint(model.encoder, model.predictor, optimizer, args.resume, args.gpu)
             print("Loaded checkpoint '{}' (epoch {})".format(args.resume, start_epoch))
         else:
             print("No checkpoint found at '{}'".format(args.resume))
 
-    # Training and validation loop
     best_acc = 0.0
-    # Pass the full encoder (backbone + projector) to KNNValidation
-    validation = KNNValidation(args, model.encoder)
+    validation = KNNValidation(args, model.encoder) # Pass the full encoder
+
     for epoch in range(start_epoch, args.epochs + 1):
-        adjust_learning_rate(optimizer, epoch, args)  # Update learning rate
+        adjust_learning_rate(optimizer, epoch, args)
         print(f"Epoch {epoch}/{args.epochs} - Training...")
 
-        # Train for one epoch
         train_loss = train(train_loader, model, criterion, optimizer, epoch, args)
-        logger.add_scalar('Loss/train', train_loss, epoch)  # Log training loss
+        logger.add_scalar('Loss/train', train_loss, epoch)
 
-        # Perform KNN validation periodically
         if epoch % args.eval_freq == 0:
             print(f"Epoch {epoch}/{args.epochs} - Validating (KNN)...")
-            val_top1_acc = validation.eval()  # Evaluate KNN accuracy
+            val_top1_acc = validation.eval()
             print('KNN Top1 Accuracy: {:.4f}'.format(val_top1_acc))
 
-            # Save the best model checkpoint (full SimSiam model)
             if val_top1_acc > best_acc:
                 best_acc = val_top1_acc
-                save_checkpoint(epoch, model, optimizer, best_acc,
+                save_checkpoint(epoch, model.encoder, model.predictor, optimizer, best_acc, # Pass encoder and predictor
                                 path.join(trial_dir, '{}_best.pth'.format(args.trial)),
                                 'Saving the best full SimSiam model!')
-            logger.add_scalar('Acc/val_top1_knn', val_top1_acc, epoch)  # Log validation accuracy
+            logger.add_scalar('Acc/val_top1_knn', val_top1_acc, epoch)
 
-        # Save model periodically (full SimSiam model)
         if epoch % args.save_freq == 0:
-            save_checkpoint(epoch, model, optimizer, val_top1_acc,
+            save_checkpoint(epoch, model.encoder, model.predictor, optimizer, val_top1_acc, # Pass encoder and predictor
                             path.join(trial_dir, 'ckpt_epoch_{}_{}.pth'.format(epoch, args.trial)),
                             'Saving checkpoint...')
 
     print('Training Finished. Best KNN accuracy achieved: {:.4f}'.format(best_acc))
 
-    # --- AS3L Stage 1: Save the pre-trained backbone (f_self) weights ---
-    # Ensure the directory for the backbone output exists
-    output_dir = path.dirname(args.backbone_output_path)
+    # --- AS3L Stage 1: Save the pre-trained encoder (f_self) weights ---
+    output_dir = path.dirname(args.encoder_output_path)
     if not path.exists(output_dir):
         makedirs(output_dir)
 
-    print(f"Saving pre-trained backbone weights (f_self) to {args.backbone_output_path}...")
-    torch.save(model.backbone.state_dict(), args.backbone_output_path)
-    print("Pre-trained backbone weights saved successfully.")
+    print(f"Saving pre-trained encoder weights (f_self) to {args.encoder_output_path}...")
+    torch.save(model.encoder.state_dict(), args.encoder_output_path) # Save the encoder's state_dict
+    print("Pre-trained encoder weights saved successfully.")
 
 
 if __name__ == '__main__':
     main()
 
-
-# python simsiam_pretrain.py     --data_root ./data     --exp_dir ./output/as3l_run_1     --trial simsiam_pretrain_cifar10_wrn282     --epochs 10     --gpu 0     --arch wrn_28_2     --batch_size 512     --num_workers 4
+# This script is designed to be run as a standalone module.
+# python simsiam_pretrain.py \
+#     --data_root ./data \
+#     --exp_dir ./output/as3l_run_4 \
+#     --trial simsiam_pretrain_cifar10_wrn282 \
+#     --epochs 1000 \
+#     --gpu 0 \
+#     --arch wrn_28_2 \
+#     --batch_size 512 \
+#     --num_workers 4 \
+#     --encoder_output_path ./output/my_as3l_runs/simsiam_pretrain_cifar10_wrn282/wrn_28_2_encoder_fself.pth
